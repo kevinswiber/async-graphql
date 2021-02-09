@@ -92,5 +92,6 @@ members = [
     "integrations/rocket",
     "integrations/tide",
     "integrations/warp",
+	#"schema_first_integrations/tide",
     "benchmark",
 ]

@@ -191,6 +191,9 @@ pub mod validators;
 pub mod registry;
 
 #[doc(hidden)]
+pub mod schema_first;
+
+#[doc(hidden)]
 pub use async_stream;
 #[doc(hidden)]
 pub use async_trait;

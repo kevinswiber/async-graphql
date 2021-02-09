@@ -1,33 +1,32 @@
 use std::any::Any;
-use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use futures_util::stream::{self, Stream, StreamExt};
+use async_graphql_value::ConstValue;
+use futures_util::stream::{Stream, StreamExt};
 use indexmap::map::IndexMap;
 
+use super::query_root::QueryRoot;
 use crate::context::{Data, QueryEnvInner, ResolveId};
 use crate::extensions::{ErrorLogger, ExtensionContext, ExtensionFactory, Extensions};
 use crate::model::__DirectiveLocation;
 use crate::parser::parse_query;
 use crate::parser::types::{DocumentOperations, OperationType};
-use crate::registry::{MetaDirective, MetaInputValue, Registry};
-use crate::resolver_utils::{resolve_container, resolve_container_serial};
-use crate::subscription::collect_subscription_streams;
-use crate::types::QueryRoot;
+use crate::registry::{MetaDirective, MetaInputValue, MetaType, Registry};
+use crate::schema::SchemaEnvInner;
 use crate::validation::{check_rules, ValidationMode};
 use crate::{
-    BatchRequest, BatchResponse, CacheControl, ContextBase, ObjectType, QueryEnv, Request,
-    Response, ServerError, SubscriptionType, Type, Value, ID,
+    BatchRequest, BatchResponse, CacheControl, ContextBase, QueryEnv, Request, Response, SchemaEnv,
+    ServerError, Type, ID,
 };
 
 /// Schema builder
-pub struct SchemaBuilder<Query, Mutation, Subscription> {
+pub struct SchemaBuilder {
     validation_mode: ValidationMode,
-    query: QueryRoot<Query>,
-    mutation: Mutation,
-    subscription: Subscription,
+    query: QueryRoot,
+    mutation: MetaType,
+    subscription: MetaType,
     registry: Registry,
     data: Data,
     complexity: Option<usize>,
@@ -36,15 +35,7 @@ pub struct SchemaBuilder<Query, Mutation, Subscription> {
     enable_federation: bool,
 }
 
-impl<Query, Mutation, Subscription> SchemaBuilder<Query, Mutation, Subscription> {
-    /// Manually register a type in the schema.
-    ///
-    /// You can use this function to register schema types that are not directly referenced.
-    pub fn register_type<T: Type>(mut self) -> Self {
-        T::create_type_info(&mut self.registry);
-        self
-    }
-
+impl SchemaBuilder {
     /// Manually register a raw GraphQL type in the schema.
     ///
     /// You can use this to register schema types that don't have an associated Rust type.
@@ -121,7 +112,7 @@ impl<Query, Mutation, Subscription> SchemaBuilder<Query, Mutation, Subscription>
     }
 
     /// Build schema.
-    pub fn finish(mut self) -> Schema<Query, Mutation, Subscription> {
+    pub fn finish(mut self) -> Schema {
         // federation
         if self.enable_federation || self.registry.has_entities() {
             self.registry.create_federation_types();
@@ -144,29 +135,11 @@ impl<Query, Mutation, Subscription> SchemaBuilder<Query, Mutation, Subscription>
 }
 
 #[doc(hidden)]
-pub struct SchemaEnvInner {
-    pub registry: Registry,
-    pub data: Data,
-}
-
-#[doc(hidden)]
-#[derive(Clone)]
-pub struct SchemaEnv(pub Arc<SchemaEnvInner>);
-
-impl Deref for SchemaEnv {
-    type Target = SchemaEnvInner;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-#[doc(hidden)]
-pub struct SchemaInner<Query, Mutation, Subscription> {
+pub struct SchemaInner {
     pub(crate) validation_mode: ValidationMode,
-    pub(crate) query: QueryRoot<Query>,
-    pub(crate) mutation: Mutation,
-    pub(crate) subscription: Subscription,
+    pub(crate) query: QueryRoot,
+    pub(crate) mutation: MetaType,
+    pub(crate) subscription: MetaType,
     pub(crate) complexity: Option<usize>,
     pub(crate) depth: Option<usize>,
     pub(crate) extensions: Vec<Box<dyn ExtensionFactory>>,
@@ -176,62 +149,36 @@ pub struct SchemaInner<Query, Mutation, Subscription> {
 /// GraphQL schema.
 ///
 /// Cloning a schema is cheap, so it can be easily shared.
-pub struct Schema<Query, Mutation, Subscription>(Arc<SchemaInner<Query, Mutation, Subscription>>);
+pub struct Schema(Arc<SchemaInner>);
 
-impl<Query, Mutation, Subscription> Clone for Schema<Query, Mutation, Subscription> {
+impl Clone for Schema {
     fn clone(&self) -> Self {
         Schema(self.0.clone())
     }
 }
 
-impl<Query, Mutation, Subscription> Default for Schema<Query, Mutation, Subscription>
-where
-    Query: Default + ObjectType + 'static,
-    Mutation: Default + ObjectType + 'static,
-    Subscription: Default + SubscriptionType + 'static,
-{
-    fn default() -> Self {
-        Schema::new(
-            Query::default(),
-            Mutation::default(),
-            Subscription::default(),
-        )
-    }
-}
-
-impl<Query, Mutation, Subscription> Deref for Schema<Query, Mutation, Subscription> {
-    type Target = SchemaInner<Query, Mutation, Subscription>;
+impl Deref for Schema {
+    type Target = SchemaInner;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl<Query, Mutation, Subscription> Schema<Query, Mutation, Subscription>
-where
-    Query: ObjectType + 'static,
-    Mutation: ObjectType + 'static,
-    Subscription: SubscriptionType + 'static,
-{
+impl Schema {
     /// Create a schema builder
     ///
     /// The root object for the query and Mutation needs to be specified.
     /// If there is no mutation, you can use `EmptyMutation`.
     /// If there is no subscription, you can use `EmptySubscription`.
-    pub fn build(
-        query: Query,
-        mutation: Mutation,
-        subscription: Subscription,
-    ) -> SchemaBuilder<Query, Mutation, Subscription> {
+    pub fn build(query: MetaType, mutation: MetaType, subscription: MetaType) -> SchemaBuilder {
+        let registry = Self::create_registry(&query, &mutation, &subscription);
         SchemaBuilder {
             validation_mode: ValidationMode::Strict,
-            query: QueryRoot {
-                inner: query,
-                disable_introspection: false,
-            },
+            query: QueryRoot::new(query),
             mutation,
             subscription,
-            registry: Self::create_registry(),
+            registry,
             data: Default::default(),
             complexity: None,
             depth: None,
@@ -240,22 +187,54 @@ where
         }
     }
 
-    pub(crate) fn create_registry() -> Registry {
+    /// Create a schema builder
+    ///
+    /// The root object for the query and Mutation needs to be specified.
+    /// If there is no mutation, you can use `EmptyMutation`.
+    /// If there is no subscription, you can use `EmptySubscription`.
+    pub fn build_with_registry(
+        query: MetaType,
+        mutation: MetaType,
+        subscription: MetaType,
+        registry: Registry,
+    ) -> SchemaBuilder {
+        SchemaBuilder {
+            validation_mode: ValidationMode::Strict,
+            query: QueryRoot::new(query),
+            mutation,
+            subscription,
+            registry,
+            data: Default::default(),
+            complexity: None,
+            depth: None,
+            extensions: Default::default(),
+            enable_federation: false,
+        }
+    }
+
+    fn get_name_from_meta_type(e: &MetaType) -> &str {
+        match e {
+            MetaType::Object { name, .. } => name,
+            MetaType::Enum { name, .. } => name,
+            MetaType::Interface { name, .. } => name,
+            MetaType::InputObject { name, .. } => name,
+            MetaType::Scalar { name, .. } => name,
+            MetaType::Union { name, .. } => name,
+        }
+    }
+
+    pub(crate) fn create_registry(
+        query: &MetaType,
+        mutation: &MetaType,
+        subscription: &MetaType,
+    ) -> Registry {
         let mut registry = Registry {
             types: Default::default(),
             directives: Default::default(),
             implements: Default::default(),
-            query_type: Query::type_name().to_string(),
-            mutation_type: if Mutation::is_empty() {
-                None
-            } else {
-                Some(Mutation::type_name().to_string())
-            },
-            subscription_type: if Subscription::is_empty() {
-                None
-            } else {
-                Some(Subscription::type_name().to_string())
-            },
+            query_type: Self::get_name_from_meta_type(query).to_string(),
+            mutation_type: Some(Self::get_name_from_meta_type(mutation).to_string()),
+            subscription_type: Some(Self::get_name_from_meta_type(subscription).to_string()),
         };
 
         registry.add_directive(MetaDirective {
@@ -316,24 +295,12 @@ where
         String::create_type_info(&mut registry);
         ID::create_type_info(&mut registry);
 
-        QueryRoot::<Query>::create_type_info(&mut registry);
-        if !Mutation::is_empty() {
-            Mutation::create_type_info(&mut registry);
-        }
-        if !Subscription::is_empty() {
-            Subscription::create_type_info(&mut registry);
-        }
-
         registry
     }
 
     /// Create a schema
-    pub fn new(
-        query: Query,
-        mutation: Mutation,
-        subscription: Subscription,
-    ) -> Schema<Query, Mutation, Subscription> {
-        Self::build(query, mutation, subscription).finish()
+    pub fn new(query: MetaType, mutation: MetaType, subscription: MetaType) -> Schema {
+        Schema::build(query, mutation, subscription).finish()
     }
 
     /// Returns SDL(Schema Definition Language) of this schema.
@@ -467,10 +434,10 @@ where
         };
 
         env.extensions.execution_start(&ctx_extension);
-
-        let data = match &env.operation.node.ty {
-            OperationType::Query => resolve_container(&ctx, &self.query).await,
-            OperationType::Mutation => resolve_container_serial(&ctx, &self.mutation).await,
+        // TODO: Fetch real response.
+        let data: Result<ConstValue, ServerError> = match &env.operation.node.ty {
+            OperationType::Query => Ok(ConstValue::Null), //resolve_container(&ctx, &self.query).await,
+            OperationType::Mutation => Ok(ConstValue::Null), //resolve_container_serial(&ctx, &self.mutation).await,
             OperationType::Subscription => {
                 return Response::from_errors(vec![ServerError::new(
                     "Subscriptions are not supported on this transport.",
@@ -522,66 +489,66 @@ where
         let schema = self.clone();
 
         async_stream::stream! {
-            let request = request.into();
-            let (mut env, cache_control) = match schema.prepare_request(request).await {
-                Ok(res) => res,
-                Err(errors) => {
-                    yield Response::from_errors(errors);
-                    return;
+                    let request = request.into();
+                    let (mut env, cache_control) = match schema.prepare_request(request).await {
+                        Ok(res) => res,
+                        Err(errors) => {
+                            yield Response::from_errors(errors);
+                            return;
+                        }
+                    };
+                    env.ctx_data = ctx_data;
+                    let env = QueryEnv::new(env);
+
+                    if env.operation.node.ty != OperationType::Subscription {
+                        yield schema
+                            .execute_once(env)
+                            .await
+                            .cache_control(cache_control);
+                        return;
+                    }
+
+                    let resolve_id = AtomicUsize::default();
+                    let ctx = env.create_context(
+                        &schema.env,
+                        None,
+                        &env.operation.node.selection_set,
+                        ResolveId::root(),
+                        &resolve_id,
+                    );
+                    let ctx_extension = ExtensionContext {
+                        schema_data: &schema.env.data,
+                        query_data: &env.ctx_data,
+                    };
+
+                    env.extensions.execution_start(&ctx_extension);
+
+                    /*let mut streams = Vec::new();
+                    if let Err(e) = collect_subscription_streams(&ctx, &schema.subscription, &mut streams) {
+                        env.extensions.execution_end(&ctx_extension);
+                        yield Response::from_errors(vec![e]);
+                        return;
+                    }*/
+
+                    env.extensions.execution_end(&ctx_extension);
+        /*
+                    let mut stream = stream::select_all(streams);
+                    while let Some(data) = stream.next().await {
+                        let is_err = data.is_err();
+                        let extensions = env.extensions.result(&ctx_extension);
+                        yield match data {
+                            Ok((name, value)) => {
+                                let mut map = BTreeMap::new();
+                                map.insert(name, value);
+                                Response::new(Value::Object(map))
+                            },
+                            Err(e) => Response::from_errors(vec![e]),
+                        }.extensions(extensions);
+                        if is_err {
+                            break;
+                        }
+                    }*/
                 }
-            };
-            env.ctx_data = ctx_data;
-            let env = QueryEnv::new(env);
-
-            if env.operation.node.ty != OperationType::Subscription {
-                yield schema
-                    .execute_once(env)
-                    .await
-                    .cache_control(cache_control);
-                return;
-            }
-
-            let resolve_id = AtomicUsize::default();
-            let ctx = env.create_context(
-                &schema.env,
-                None,
-                &env.operation.node.selection_set,
-                ResolveId::root(),
-                &resolve_id,
-            );
-            let ctx_extension = ExtensionContext {
-                schema_data: &schema.env.data,
-                query_data: &env.ctx_data,
-            };
-
-            env.extensions.execution_start(&ctx_extension);
-
-            let mut streams = Vec::new();
-            if let Err(e) = collect_subscription_streams(&ctx, &schema.subscription, &mut streams) {
-                env.extensions.execution_end(&ctx_extension);
-                yield Response::from_errors(vec![e]);
-                return;
-            }
-
-            env.extensions.execution_end(&ctx_extension);
-
-            let mut stream = stream::select_all(streams);
-            while let Some(data) = stream.next().await {
-                let is_err = data.is_err();
-                let extensions = env.extensions.result(&ctx_extension);
-                yield match data {
-                    Ok((name, value)) => {
-                        let mut map = BTreeMap::new();
-                        map.insert(name, value);
-                        Response::new(Value::Object(map))
-                    },
-                    Err(e) => Response::from_errors(vec![e]),
-                }.extensions(extensions);
-                if is_err {
-                    break;
-                }
-            }
-        }
     }
 
     /// Execute a GraphQL subscription.
