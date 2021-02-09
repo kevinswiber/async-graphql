@@ -1,6 +1,7 @@
 mod cache_control;
 mod export_sdl;
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -320,6 +321,32 @@ impl Registry {
             *self.types.get_mut(&*name).unwrap() = ty;
         }
         T::qualified_type_name()
+    }
+
+    pub fn create_raw_type<F: FnMut(&mut Registry) -> MetaType>(
+        &mut self,
+        name: Cow<'static, str>,
+        mut f: F,
+    ) -> String {
+        if !self.types.contains_key(name.as_ref()) {
+            // Inserting a fake type before calling the function allows recursive types to exist.
+            self.types.insert(
+                name.clone().into_owned(),
+                MetaType::Object {
+                    name: "".to_string(),
+                    description: None,
+                    fields: Default::default(),
+                    cache_control: Default::default(),
+                    extends: false,
+                    keys: None,
+                    visible: None,
+                },
+            );
+            let ty = f(self);
+            *self.types.get_mut(&*name).unwrap() = ty;
+        }
+
+        format!("{}!", name)
     }
 
     pub fn create_dummy_type<T: crate::Type>(&mut self) -> MetaType {

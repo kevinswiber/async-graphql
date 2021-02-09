@@ -45,6 +45,14 @@ impl<Query, Mutation, Subscription> SchemaBuilder<Query, Mutation, Subscription>
         self
     }
 
+    /// Manually register a raw GraphQL type in the schema.
+    ///
+    /// You can use this to register schema types that don't have an associated Rust type.
+    pub fn update_registry<F: FnMut(&mut Registry)>(mut self, f: &mut F) -> Self {
+        f(&mut self.registry);
+        self
+    }
+
     /// Disable introspection queries.
     pub fn disable_introspection(mut self) -> Self {
         self.query.disable_introspection = true;
